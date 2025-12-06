@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS items
     id        UUID PRIMARY KEY NOT NULL UNIQUE DEFAULT gen_random_uuid(),
     item      TEXT             NOT NULL,
     count     INT              NOT NULL,
+    enchantments JSONB,
 
     container UUID REFERENCES containers (id) ON DELETE CASCADE
 );
@@ -20,14 +21,10 @@ CREATE TABLE IF NOT EXISTS items
 CREATE OR REPLACE FUNCTION distance(
     x1 double precision, y1 double precision, z1 double precision,
     x2 double precision, y2 double precision, z2 double precision
-) RETURNS double precision AS
-$$
-BEGIN
-    RETURN sqrt(
-            pow(x2 - x1, 2) +
-            pow(y2 - y1, 2) +
-            pow(z2 - z1, 2)
-           );
-END;
-$$ LANGUAGE plpgsql IMMUTABLE
-                    STRICT;
+) RETURNS double precision
+    LANGUAGE sql IMMUTABLE STRICT
+AS $$
+SELECT sqrt(
+               (x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2
+       );
+$$;
