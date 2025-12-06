@@ -1,5 +1,7 @@
 package space.ranzeplay.containeritemfinder.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Getter;
 import lombok.SneakyThrows;
 import net.minecraft.block.ShulkerBoxBlock;
@@ -19,6 +21,8 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ChunkStatus;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import space.ranzeplay.containeritemfinder.Main;
@@ -37,6 +41,8 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
 
+import static space.ranzeplay.containeritemfinder.service.ContainerIndexService.extractEnchantments;
+
 
 public class TrackingService {
     private Connection connection;
@@ -44,7 +50,7 @@ public class TrackingService {
     private final ThreadPoolExecutor scheduler;
     private final ThreadPoolExecutor instantScanScheduler;
     private final List<AABB> trackingAreas;
-
+    private static final ObjectMapper objectMapper = new ObjectMapper();
     private Date lastScan;
     private final long interval;
     @Getter
@@ -78,12 +84,14 @@ public class TrackingService {
 
         // Migrate database schema
         final var path = getClass().getClassLoader().getResource("init.sql");
+        logger.warn("IT WORKS");
         if (path == null) {
             logger.error("Failed to find database migration script.");
             throw new IllegalStateException("Failed to find database migration script.");
         }
 
         final var stream = getClass().getClassLoader().getResourceAsStream("init.sql");
+        logger.warn("IT WORKS 2");
         if (stream == null) {
             logger.error("Failed to load database migration script.");
             throw new IllegalStateException("Failed to load database migration script.");
@@ -278,54 +286,65 @@ public class TrackingService {
             return;
         }
 
-        var fromX = Math.min(area.getP1().getX(), area.getP2().getX());
-        var toX = Math.max(area.getP1().getX(), area.getP2().getX());
+        int fromX = Math.min(area.getP1().getX(), area.getP2().getX());
+        int toX = Math.max(area.getP1().getX(), area.getP2().getX());
+        int fromY = Math.min(area.getP1().getY(), area.getP2().getY());
+        int toY = Math.max(area.getP1().getY(), area.getP2().getY());
+        int fromZ = Math.min(area.getP1().getZ(), area.getP2().getZ());
+        int toZ = Math.max(area.getP1().getZ(), area.getP2().getZ());
 
-        var fromY = Math.min(area.getP1().getY(), area.getP2().getY());
-        var toY = Math.max(area.getP1().getY(), area.getP2().getY());
+        try (var dbClearStmt = connection.prepareStatement(
+                "DELETE FROM containers WHERE world = ? AND x >= ? AND x <= ? AND y >= ? AND y <= ? AND z >= ? AND z <= ?")) {
+            dbClearStmt.setString(1, area.getWorld());
+            dbClearStmt.setInt(2, fromX);
+            dbClearStmt.setInt(3, toX);
+            dbClearStmt.setInt(4, fromY);
+            dbClearStmt.setInt(5, toY);
+            dbClearStmt.setInt(6, fromZ);
+            dbClearStmt.setInt(7, toZ);
+            dbClearStmt.execute();
+        }
 
-        var fromZ = Math.min(area.getP1().getZ(), area.getP2().getZ());
-        var toZ = Math.max(area.getP1().getZ(), area.getP2().getZ());
+        int chunkFromX = fromX >> 4;
+        int chunkToX = toX >> 4;
+        int chunkFromZ = fromZ >> 4;
+        int chunkToZ = toZ >> 4;
 
-        // Remove all existing entries in the area
+        for (int cx = chunkFromX; cx <= chunkToX; cx++) {
+            for (int cz = chunkFromZ; cz <= chunkToZ; cz++) {
+                Chunk chunk = world.getChunk(cx, cz);
 
-        var dbClearStmt = connection.prepareStatement(
-                "DELETE FROM containers WHERE world = ? AND x >= ? AND x <= ? AND y >= ? AND y <= ? AND z >= ? AND z <= ?"
-        );
+                for (BlockPos pos : chunk.getBlockEntityPositions()) {
 
-        dbClearStmt.setString(1, area.getWorld());
-        dbClearStmt.setInt(2, fromX);
-        dbClearStmt.setInt(3, toX);
-        dbClearStmt.setInt(4, fromY);
-        dbClearStmt.setInt(5, toY);
-        dbClearStmt.setInt(6, fromZ);
-        dbClearStmt.setInt(7, toZ);
-        dbClearStmt.execute();
-        dbClearStmt.close();
+                    int x = pos.getX();
+                    int z = pos.getZ();
+                    if (x < fromX || x > toX || z < fromZ || z > toZ) continue;
 
-        for (int x = fromX; x <= toX; x++) {
-            for (int y = fromY; y <= toY; y++) {
-                for (int z = fromZ; z <= toZ; z++) {
-                    scanOne(world, new BlockPos(x, y, z), false);
+                    BlockEntity be = chunk.getBlockEntity(pos);
+                    if (be instanceof ChestBlockEntity || be instanceof ShulkerBoxBlockEntity) {
+                        scanOne(world, be, false);
+                    }
                 }
             }
         }
     }
 
-    public void scanOne(World world, BlockPos pos, boolean removeExisting) throws SQLException {
+    public void scanOne(World world, BlockEntity be, boolean removeExisting) throws SQLException {
+        var pos = be.getPos();
+
         if(removeExisting) {
             removeBlockFromTracking(pos, world);
         }
 
         var blockState = world.getBlockState(pos);
-        var blockEntity = world.getChunk(pos).getBlockEntity(pos);
 
-        HashMap<String, Integer> items = tryGetContainerItems(blockEntity);
+        HashMap<String, Integer> items = tryGetContainerItems(be);
+        HashMap<String, Map<String, Integer>> enchantmentsMap = tryGetContainerItemEnchantments(be);
+
         if (items.isEmpty()) {
             return;
         }
 
-        // Insert new entry
         var dbInsertStmt = connection.prepareStatement(
                 "INSERT INTO containers (world, x, y, z, block) VALUES (?, ?, ?, ?, ?) RETURNING id"
         );
@@ -341,21 +360,66 @@ public class TrackingService {
         }
 
         var containerId = (UUID) dbInsertRs.getObject("id");
-
         dbInsertStmt.close();
 
         var dbItemStmt = connection.prepareStatement(
-                "INSERT INTO items (item, count, container) VALUES (?, ?, ?)"
+                "INSERT INTO items (item, count, container, enchantments) VALUES (?, ?, ?, ?::jsonb)"
         );
-        for (var itemId : items.keySet()) {
+
+        for (var itemName : items.keySet()) {
             dbItemStmt.clearParameters();
-            dbItemStmt.setString(1, itemId);
-            dbItemStmt.setInt(2, items.get(itemId));
+            dbItemStmt.setString(1, itemName);
+            dbItemStmt.setInt(2, items.get(itemName));
             dbItemStmt.setObject(3, containerId);
+
+            Map<String, Integer> enchants = enchantmentsMap.getOrDefault(itemName, Collections.emptyMap());
+            try {
+                String enchJson = objectMapper.writeValueAsString(enchants);
+                dbItemStmt.setString(4, enchJson);
+            } catch (JsonProcessingException e) {
+                dbItemStmt.setString(4, "{}");
+            }
+
             dbItemStmt.execute();
         }
 
         dbItemStmt.close();
+    }
+
+    private HashMap<String, Map<String, Integer>> tryGetContainerItemEnchantments(BlockEntity container) {
+        HashMap<String, Map<String, Integer>> result = new HashMap<>();
+
+        switch (container) {
+            case null -> {
+                return result;
+            }
+            case ChestBlockEntity chest -> {
+                for (int i = 0; i < chest.size(); i++) {
+                    ItemStack stack = chest.getStack(i);
+                    if (stack.isEmpty()) continue;
+
+                    Map<String, Integer> enchants = extractEnchantments(stack); // метод, который мы писали ранее
+                    if (!enchants.isEmpty()) {
+                        result.put(stack.getItem().getTranslationKey(), enchants);
+                    }
+                }
+            }
+            case ShulkerBoxBlockEntity shulker -> {
+                for (int i = 0; i < shulker.size(); i++) {
+                    ItemStack stack = shulker.getStack(i);
+                    if (stack.isEmpty()) continue;
+
+                    Map<String, Integer> enchants = extractEnchantments(stack);
+                    if (!enchants.isEmpty()) {
+                        result.put(stack.getItem().getTranslationKey(), enchants);
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+
+        return result;
     }
 
     private static @NotNull HashMap<String, Integer> tryGetContainerItems(BlockEntity blockEntity) {
@@ -469,9 +533,14 @@ public class TrackingService {
                                 break;
                             }
                         }
-
-                        scanOne(world, task.getLocation().toBlockPos(), true);
-                        logger.debug("Performed delayed scan at {} @ {}", task.getLocation().toString(), task.getLocation().getWorld());
+                        var pos = task.getLocation().toBlockPos();
+                        assert world != null;
+                        Chunk chunk = world.getChunk(pos.getX() >> 4, pos.getZ() >> 4, ChunkStatus.FULL, false);
+                        if (chunk != null) {
+                            BlockEntity be = chunk.getBlockEntity(pos);
+                            scanOne(world, be, true);
+                            logger.debug("Performed delayed scan at {} @ {}", task.getLocation().toString(), task.getLocation().getWorld());
+                        }
                     } catch (SQLException e) {
                         logger.error("Failed to perform delayed scan: ", e);
                     }

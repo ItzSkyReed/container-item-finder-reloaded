@@ -1,9 +1,14 @@
 package space.ranzeplay.containeritemfinder.service;
 
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.entity.ChestBlockEntity;
 import net.minecraft.block.entity.ShulkerBoxBlockEntity;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ItemEnchantmentsComponent;
+import net.minecraft.enchantment.Enchantment;
 import net.minecraft.item.ItemStack;
+import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -12,6 +17,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.chunk.Chunk;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,7 +27,29 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ContainerIndexService {
     private static final Map<UUID, SearchTask> activeTasks = new ConcurrentHashMap<>();
 
-    public record IndexedItem(String itemName, String id, int count, BlockPos containerPos) {
+    public record IndexedItem(String itemName, String id, int count, BlockPos containerPos, Map<String, Integer> enchantments) {
+    }
+
+    public static Map<String, Integer> extractEnchantments(ItemStack stack) {
+        Map<String, Integer> enchants = new HashMap<>();
+
+        ItemEnchantmentsComponent enchComp = stack.getComponents().get(DataComponentTypes.ENCHANTMENTS);
+        if (enchComp == null) {
+            return Collections.emptyMap();
+        }
+
+        for (Object2IntMap.Entry<RegistryEntry<Enchantment>> entry : enchComp.getEnchantmentEntries()) {
+            RegistryEntry<Enchantment> reg = entry.getKey();
+            if (reg == null) continue;
+
+            Enchantment ench = reg.value();
+            if (ench == null) continue;
+
+            int level = entry.getIntValue();
+            enchants.put(ench.description().getString(), level);
+
+        }
+        return enchants;
     }
 
     public static List<IndexedItem> indexItemsInContainer(BlockEntity container, BlockPos pos) {
@@ -31,11 +59,13 @@ public class ContainerIndexService {
             for (int i = 0; i < chest.size(); i++) {
                 ItemStack stack = chest.getStack(i);
                 if (!stack.isEmpty()) {
+
                     items.add(new IndexedItem(
                             stack.getItem().getName().getString(),
                             stack.getItem().getTranslationKey(),
                             stack.getCount(),
-                            pos
+                            pos,
+                            extractEnchantments(stack)
                     ));
                 }
             }
@@ -47,7 +77,8 @@ public class ContainerIndexService {
                             stack.getItem().getName().getString(),
                             stack.getItem().getTranslationKey(),
                             stack.getCount(),
-                            pos
+                            pos,
+                            extractEnchantments(stack)
                     ));
                 }
             }
@@ -58,77 +89,50 @@ public class ContainerIndexService {
 
     private static List<IndexedItem> indexContainersInRange(SearchTask task, ServerWorld world, BlockPos center, int range) {
         List<IndexedItem> allItems = new ArrayList<>();
-        Set<BlockPos> visited = new HashSet<>();
-        Queue<BlockPos> queue = new LinkedList<>();
-        int totalContainersSearched = 0;
+        int rangeSq = range * range;
 
-        // Start with center position
-        queue.offer(center);
-        visited.add(center);
+        int chunkRange = range >> 4;
+        int cx = center.getX() >> 4;
+        int cz = center.getZ() >> 4;
 
-        // BFS directions (6 directions: up, down, north, south, east, west)
-        int[][] directions = {
-                {0, 1, 0},  // up
-                {0, -1, 0}, // down
-                {0, 0, -1}, // north
-                {0, 0, 1},  // south
-                {1, 0, 0},  // east
-                {-1, 0, 0}  // west
-        };
+        int totalContainers = 0;
 
-        int currentDistance = 0;
-        int nodesAtCurrentDistance = 1;
-        int nodesAtNextDistance = 0;
 
-        while (!queue.isEmpty() && !task.isCancelled()) {
-            BlockPos current = queue.poll();
-            assert current != null;
-            nodesAtCurrentDistance--;
+        for (int dx = -chunkRange; dx <= chunkRange; dx++) {
+            for (int dz = -chunkRange; dz <= chunkRange; dz++) {
 
-            // Check if current position has a container
-            BlockEntity blockEntity = world.getChunk(current).getBlockEntity(current);
-            if (blockEntity instanceof ChestBlockEntity || blockEntity instanceof ShulkerBoxBlockEntity) {
-                totalContainersSearched++;
-                allItems.addAll(indexItemsInContainer(blockEntity, current));
+                Chunk chunk = world.getChunk(cx + dx, cz + dz);
 
-                // Send message when a container is indexed
-                if (task.source != null) {
-                    task.source.sendMessage(task.createIndexedContainerMessage(current));
-                }
-            }
+                for (BlockPos be : chunk.getBlockEntityPositions()) {
 
-            // If we haven't reached max range, explore neighbors
-            if (currentDistance < range) {
-                for (int[] dir : directions) {
-                    BlockPos nextPos = new BlockPos(
-                            current.getX() + dir[0],
-                            current.getY() + dir[1],
-                            current.getZ() + dir[2]
-                    );
+                    int y = be.getY();
+                    BlockEntity beEntity = chunk.getBlockEntity(be);
 
-                    if (!visited.contains(nextPos)) {
-                        visited.add(nextPos);
-                        queue.offer(nextPos);
-                        nodesAtNextDistance++;
+                    // distance check
+                    int rx = be.getX() - center.getX();
+                    int ry = y - center.getY();
+                    int rz = be.getZ() - center.getZ();
+                    int distSq = rx * rx + ry * ry + rz * rz;
+                    if (distSq > rangeSq) {
+                        continue;
                     }
+
+                    // container check
+                    if (beEntity instanceof ChestBlockEntity || beEntity instanceof ShulkerBoxBlockEntity) {
+                        totalContainers++;
+                        allItems.addAll(indexItemsInContainer(beEntity, be));
+
+                        if (task.source != null) {
+                            task.source.sendMessage(task.createIndexedContainerMessage(be));
+                        }
+                    }
+
+                    task.blocksSearched.incrementAndGet();
                 }
             }
-
-            if (nodesAtCurrentDistance == 0) {
-                currentDistance++;
-                nodesAtCurrentDistance = nodesAtNextDistance;
-                nodesAtNextDistance = 0;
-            }
-
-            // Update blocks searched count and send heartbeat
-            task.blocksSearched.incrementAndGet();
-            double distance = Math.sqrt(
-                    Math.pow(current.getX() - center.getX(), 2) + Math.pow(current.getY() - center.getY(), 2) + Math.pow(current.getZ() - center.getZ(), 2)
-            );
-            task.sendHeartbeat(distance);
         }
 
-        task.totalContainersSearched = totalContainersSearched;
+        task.totalContainersSearched = totalContainers;
         return allItems;
     }
 
@@ -141,34 +145,68 @@ public class ContainerIndexService {
         MutableText message = Text.empty();
 
         // First line: Summary
-        message.append(Text.translatable("info.cif.instant.index.summary_1", items.size(), totalContainersSearched)
-                        .formatted(Formatting.GREEN))
-                .append(Text.literal("\n"));
-
-        // Group items by name and count total
-        Map<String, Integer> itemTotals = new HashMap<>();
-        Map<String, List<BlockPos>> itemLocations = new HashMap<>();
+        Map<String, List<IndexedItem>> grouped = new HashMap<>();
 
         for (IndexedItem item : items) {
-            itemTotals.merge(item.itemName(), item.count(), Integer::sum);
-            itemLocations.computeIfAbsent(item.itemName(), k -> new ArrayList<>())
-                    .add(item.containerPos());
+
+            // Build enchantment signature (null or sorted string)
+            String enchKey;
+            if (item.enchantments() == null || item.enchantments().isEmpty()) {
+                enchKey = "NO_ENCH";
+            } else {
+                // Sort enchantments to make order irrelevant
+                StringBuilder sb = new StringBuilder();
+                item.enchantments().entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey())
+                        .forEach(e -> sb.append(e.getKey()).append(":").append(e.getValue()).append(";"));
+                enchKey = sb.toString();
+            }
+
+            // Final grouping key: name + ench signature
+            String key = item.itemName() + "|" + enchKey;
+
+            grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(item);
         }
 
-        // Sort items by total count
-        List<Map.Entry<String, Integer>> sortedItems = new ArrayList<>(itemTotals.entrySet());
-        sortedItems.sort(Map.Entry.<String, Integer>comparingByValue().reversed());
+        // Sort groups by total item count
+        List<Map.Entry<String, List<IndexedItem>>> sorted = new ArrayList<>(grouped.entrySet());
+        sorted.sort((a, b) -> {
+            int countA = a.getValue().stream().mapToInt(IndexedItem::count).sum();
+            int countB = b.getValue().stream().mapToInt(IndexedItem::count).sum();
+            return Integer.compare(countB, countA);
+        });
 
-        // Add each item's information
-        for (Map.Entry<String, Integer> entry : sortedItems) {
-            String itemName = entry.getKey();
-            int totalCount = entry.getValue();
-            List<BlockPos> locations = itemLocations.get(itemName);
+        // Build output
+        for (Map.Entry<String, List<IndexedItem>> group : sorted) {
 
-            message.append(Text.translatable("info.cif.instant.index.item_partial",
-                            totalCount, itemName, locations.size())
-                    .formatted(Formatting.AQUA))
-                    .append(Text.literal("\n"));
+            List<IndexedItem> list = group.getValue();
+            IndexedItem first = list.getFirst();
+
+            int totalCount = list.stream().mapToInt(IndexedItem::count).sum();
+            int containers = list.size();
+
+            // Header line
+            message.append(
+                    Text.literal(totalCount + "x " + first.itemName() + " (" + containers + ")")
+                            .formatted(Formatting.AQUA)
+            ).append(Text.literal("\n"));
+
+            // Show enchantments only once per group
+            if (first.enchantments() != null && !first.enchantments().isEmpty()) {
+
+                message.append(Text.literal("  • ").formatted(Formatting.GRAY));
+
+                MutableText enchLine = Text.empty();
+
+                first.enchantments().entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey())
+                        .forEach(e -> enchLine.append(
+                                Text.literal(e.getKey().replace("enchantment.minecraft.", "") + " " + e.getValue())
+                                        .formatted(Formatting.LIGHT_PURPLE)
+                        ).append(Text.literal(" ")));
+
+                message.append(enchLine).append(Text.literal("\n"));
+            }
         }
 
         return message;
