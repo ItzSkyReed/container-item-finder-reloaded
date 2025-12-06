@@ -87,6 +87,23 @@ jar {
     from("LICENSE") {
         rename { "${it}_${project.archivesBaseName}" }
     }
+    from(sourceSets.main.output)
+
+    from {
+        configurations.runtimeClasspath.findAll {
+            it.name.contains("postgresql")
+        }.collect { zipTree(it) }
+    }
+
+    archiveBaseName.set(project.archivesBaseName)
+    archiveVersion.set(project.version)
+    archiveClassifier.set('')
+
+    manifest {
+        attributes(
+                'Main-Class': 'knot.space.ranzeplay.containeritemfinder.Main'
+        )
+    }
 }
 
 // configure the maven publication
